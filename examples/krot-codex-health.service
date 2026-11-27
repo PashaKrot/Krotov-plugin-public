@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the configured Codex App Server
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -Es /usr/libexec/krotov-plugin/codex-root-health.py
+RuntimeDirectory=krotov-plugin-health
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077

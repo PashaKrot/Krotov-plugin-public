@@ -1,0 +1,445 @@
+import { afterEach, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { CodexSession, type ApprovalRequest } from '../../src/codex/session.js'
+import { startExternalTasks } from '../../src/codex/external.js'
+import { automaticContinuation, hideContinuationMarker } from '../../src/codex/continuation.js'
+
+const dirs: string[] = []
+const sessions: CodexSession[] = []
+
+function fixture(auth: string = 'chatgpt', approve?: (request: ApprovalRequest) => Promise<'accept' | 'decline' | 'cancel'>,
+  onActivity?: ConstructorParameters<typeof CodexSession>[0]['onActivity'], env = process.env, riskyApprovals = false) {
+  const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-test-'))
+  dirs.push(cwd)
+  const stateFile = join(cwd, 'thread.json')
+  const create = (override: Partial<ConstructorParameters<typeof CodexSession>[0]> = {}) => {
+    const session = new CodexSession({
+      cwd: import.meta.dir, stateFile, env, riskyApprovals,
+      command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts'), auth],
+      ...(approve ? { approve } : {}),
+      ...(onActivity ? { onActivity } : {}),
+      ...override,
+    }, () => {})
+    sessions.push(session)
+    return session
+  }
+  return { create, readThread: () => JSON.parse(readFileSync(stateFile, 'utf8')), stateFile }
+}
+
+afterEach(() => {
+  for (const session of sessions.splice(0)) session.close()
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+test('sends high by default and the selected supported effort on the next turn of an existing conversation', async () => {
+  let model: string | undefined
+  let effort: 'xhigh' | undefined
+  const session = fixture().create({
+    env: { ...process.env, KROT_TEST_EFFORT: '1' },
+    selectedModel: () => model,
+    selectedReasoningEffort: () => effort,
+  })
+  await session.initialize()
+  expect((await session.run('report effort')).text).toBe('[null,"high"]')
+  effort = 'xhigh'
+  expect((await session.run('report effort')).text).toBe('[null,"xhigh"]')
+  model = 'gpt-small'
+  expect((await session.run('report effort')).text).toBe('["gpt-small","medium"]')
+})
+
+test('keeps the final answer and resumes the same thread after restart', async () => {
+  const state = fixture()
+  const first = state.create()
+  await first.initialize()
+  expect(await first.run('first')).toEqual({ status: 'completed', text: 'first' })
+  const id = state.readThread()
+  first.close()
+  const restarted = state.create()
+  await restarted.initialize()
+  expect(await restarted.run('next')).toEqual({ status: 'completed', text: 'next' })
+  expect(state.readThread()).toBe(id)
+  restarted.reset()
+  expect(state.readThread()).toBeNull()
+  await restarted.run('new')
+  expect(state.readThread()).not.toBe(id)
+})
+
+test('refreshes context once before a turn when enabling or disabling native approvals', async () => {
+  const state = fixture()
+  const previous = state.create()
+  await previous.initialize()
+  await previous.run('Before changing approval policy')
+  const thread = state.readThread()
+  previous.close()
+
+  const observed: string[] = []
+  const callbacks = {
+    approve: async () => 'decline' as const,
+    onActivity: (event: Parameters<NonNullable<ConstructorParameters<typeof CodexSession>[0]['onActivity']>>[0]) => {
+      if (event.method === 'thread/tokenUsage/updated') observed.push('compacted')
+    },
+  }
+  const enabled = state.create(callbacks)
+  await enabled.initialize()
+  await enabled.resume(thread)
+  expect(observed).toEqual([])
+  expect(await enabled.run('After enabling approvals', [], () => observed.push('owner turn'))).toMatchObject({ status: 'completed' })
+  expect(observed).toEqual(['compacted', 'owner turn'])
+  expect(state.readThread()).toBe(thread)
+  enabled.close()
+
+  observed.length = 0
+  const risky = state.create({ ...callbacks, riskyApprovals: true })
+  await risky.initialize()
+  await risky.run('Same native policy', [], () => observed.push('owner turn'))
+  expect(observed).toEqual(['owner turn'])
+  risky.close()
+
+  observed.length = 0
+  const disabled = state.create({ onActivity: callbacks.onActivity })
+  await disabled.initialize()
+  await disabled.run('After disabling approvals', [], () => observed.push('owner turn'))
+  expect(observed).toEqual(['compacted', 'owner turn'])
+  expect(state.readThread()).toBe(thread)
+})
+
+test('keeps an unmarked thread eligible for refresh after compaction fails and accepts successful manual recovery', async () => {
+  const state = fixture()
+  const thread = 'existing-conversation'
+  writeFileSync(state.stateFile, JSON.stringify(thread))
+  const execution = { approve: async () => 'decline' as const }
+  const broken = state.create({ ...execution, env: { ...process.env, KROT_TEST_COMPACTION_FAIL: '1' } })
+  await broken.initialize()
+  let started = 0
+  await expect(broken.run('Owner work must wait', [], () => { started++ })).rejects.toThrow('approval policy')
+  expect(started).toBe(0)
+  expect(state.readThread()).toBe(thread)
+  broken.close()
+
+  const next = state.create(execution)
+  await next.initialize()
+  expect(await next.compact()).toBe('completed')
+  next.close()
+
+  let compactions = 0
+  const reopened = state.create({ ...execution, onActivity: event => {
+    if (event.method === 'thread/tokenUsage/updated') compactions++
+  } })
+  await reopened.initialize()
+  expect(await reopened.run('Work after manual recovery', [], () => { started++ })).toMatchObject({ status: 'completed' })
+  expect(started).toBe(1)
+  expect(compactions).toBe(0)
+})
+
+test('leaves a busy legacy thread alone and refreshes it before activating a goal when idle', async () => {
+  const state = fixture()
+  const thread = 'existing-conversation'
+  writeFileSync(state.stateFile, JSON.stringify(thread))
+  const observed: string[] = []
+  const execution = {
+    approve: async () => 'decline' as const,
+    onActivity: (event: Parameters<NonNullable<ConstructorParameters<typeof CodexSession>[0]['onActivity']>>[0]) => {
+      if (event.method === 'thread/tokenUsage/updated') observed.push('compacted')
+      if (event.method === 'turn/started' && (event.params.turn as { id?: string }).id === 'goal-turn') observed.push('goal')
+    },
+  }
+  const busy = state.create({ ...execution, env: { ...process.env, KROT_TEST_THREAD_ACTIVE: '1' } })
+  await busy.initialize()
+  await busy.resume(thread)
+  await expect(busy.setGoal(thread, 'active', 'Finish the previous work')).rejects.toThrow('approval policy')
+  expect(observed).toEqual([])
+  busy.close()
+
+  let finished!: () => void
+  const goal = new Promise<void>(resolve => { finished = resolve })
+  const idle = state.create({ ...execution, mayRunGoal: id => id === thread, onGoalResult: () => finished() })
+  await idle.initialize()
+  await idle.resume(thread)
+  await idle.setGoal(thread, 'active', 'Finish the previous work')
+  await goal
+  expect(observed).toEqual(['compacted', 'goal'])
+  expect(state.readThread()).toBe(thread)
+})
+
+test('relays a scoped MCP approval through the existing one-time callback', async () => {
+  const requests: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async request => {
+    requests.push(request)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  const accepted = await session.run('mcp-approval:valid')
+  expect(JSON.parse(accepted.text)).toEqual({ action: 'accept', content: {} })
+  for (const scenario of ['stale', 'url']) {
+    const invalid = await session.run('mcp-approval:' + scenario)
+    expect(JSON.parse(invalid.text)).toEqual({ action: 'cancel' })
+  }
+  expect(requests).toEqual([{
+    kind: 'mcp', reason: 'Allow opening this test task?', target: 'example-tasks / task_read\n{\n  "id": 42\n}',
+  }])
+})
+
+test('requires a current-turn approval for a hosted GitHub write', async () => {
+  const requests: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async request => {
+    requests.push(request)
+    return 'decline'
+  }).create()
+  await session.initialize()
+  expect(JSON.parse((await session.run('mcp-approval:github')).text)).toEqual({ action: 'decline' })
+  expect(JSON.parse((await session.run('mcp-approval:github-stale')).text)).toEqual({ action: 'cancel' })
+  expect(requests.map(request => request.target)).toEqual(['GitHub / create_tree\nРепозиторий: example/private'])
+})
+
+test('does not open a worker MCP card resolved during the scope lookup', async () => {
+  const requests: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async request => {
+    requests.push(request)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect(JSON.parse((await session.run('mcp-approval:github-resolved')).text)).toEqual({ action: 'cancel' })
+  expect(requests).toEqual([])
+})
+
+test('checks whether the requested worker thread is idle or unloaded', async () => {
+  const session = fixture().create()
+  await session.initialize()
+  expect(await session.threadIsIdle('idle-child')).toBe(true)
+  expect(await session.threadIsIdle('unloaded-child')).toBe(true)
+  expect(await session.threadIsIdle('active-child')).toBe(false)
+  expect(await session.threadIsIdle('wrong-thread')).toBe(false)
+})
+
+test('interrupts a running turn and can run a new turn afterward', async () => {
+  const session = fixture().create()
+  await session.initialize()
+  await session.run('initialize thread')
+  const pending = session.run('wait')
+  await Bun.sleep(0)
+  expect(await session.stop()).toBe(true)
+  expect(await pending).toEqual({ status: 'interrupted', text: '' })
+  expect(await session.run('next')).toEqual({ status: 'completed', text: 'next' })
+})
+
+test('stops during thread initialization without starting a turn', async () => {
+  const session = fixture().create()
+  await session.initialize()
+  const pending = session.run('wait')
+  expect(await session.stop()).toBe(true)
+  expect(await pending).toEqual({ status: 'interrupted', text: '' })
+  expect(await session.run('next')).toEqual({ status: 'completed', text: 'next' })
+})
+
+test('steers the active turn and receives a reply while the turn is still running', async () => {
+  let answered!: (text: unknown) => void
+  const reply = new Promise<unknown>(resolve => { answered = resolve })
+  const session = fixture('chatgpt', undefined, event => {
+    const item = event.params.item as { phase?: string; text?: string } | undefined
+    if (item?.phase === 'commentary' && item.text !== 'status') answered(item.text)
+  }).create()
+  await session.initialize()
+  expect(await session.steer('Too early', 1)).toBe(false)
+  await session.run('initialize thread')
+  const running = session.run('wait')
+  while (!await session.steer('How is it going?', 2)) await Bun.sleep(5)
+  expect(await reply).toBe('Follow-up: How is it going?')
+  expect(session.isRunning).toBe(true)
+  expect(await session.goal()).toBeNull()
+  await session.stop()
+  expect((await running).status).toBe('interrupted')
+})
+
+test('continues only when the current turn emits its own marker and keeps the owner objective', () => {
+  const continuation = automaticContinuation('The original owner task')
+  const marker = continuation.instructions.match(/KROT_CONTINUE_[a-f0-9-]{36}/)?.[0]
+  expect(marker).toBeDefined()
+  expect(continuation.take('Done.')).toBeUndefined()
+  expect(continuation.take('Progress\n' + marker + '\n```')).toBeUndefined()
+  expect(continuation.take('Progress\n' + marker)).toBe('Progress')
+  expect(continuation.objective).toBe('The original owner task')
+  expect(hideContinuationMarker('Progress\n' + marker)).toBe('Progress')
+})
+
+test('compacts the existing thread and captures its native token usage', async () => {
+  const state = fixture()
+  const session = state.create()
+  await session.initialize()
+  await expect(session.compact()).rejects.toThrow('no Codex conversation')
+  await session.run('first')
+  const thread = state.readThread()
+  expect(await session.compact()).toBe('completed')
+  expect(state.readThread()).toBe(thread)
+  expect(session.status).toEqual({
+    hasThread: true, model: 'gpt-test', usage: { usedTokens: 10, windowTokens: 100 },
+  })
+  session.reset()
+  expect(session.status).toEqual({ hasThread: false, model: undefined, usage: undefined })
+})
+
+test('switches back to a known conversation and reads its turns and account metadata', async () => {
+  const state = fixture()
+  const session = state.create()
+  await session.initialize()
+  await session.run('first')
+  const original = state.readThread()
+  session.reset()
+  await session.run('second')
+  expect(state.readThread()).not.toBe(original)
+  await session.resume(original)
+  expect(state.readThread()).toBe(original)
+  expect(await session.models()).toEqual([{ name: 'gpt-test', default: true }])
+  expect(await session.usageLimits()).toEqual([{ used: 17, minutes: 300 }])
+  expect(await session.recentTurns()).toMatchObject({ partial: false, turns: [{ items: [{ text: 'Example' }] }] })
+})
+
+test('delivers the result of a native goal turn authorized for this conversation', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'krot-codex-goal-'))
+  dirs.push(cwd)
+  let allowed: string | undefined
+  let ended!: (text: string) => void
+  const result = new Promise<string>(resolve => { ended = resolve })
+  const session = new CodexSession({
+    cwd: import.meta.dir, stateFile: join(cwd, 'thread.json'), env: process.env,
+    command: [process.execPath, join(import.meta.dir, 'fake-app-server.ts')],
+    mayRunGoal: thread => allowed === thread,
+    onGoalResult: (_thread, answer) => ended(answer.text),
+  }, () => {})
+  sessions.push(session)
+  await session.initialize()
+  allowed = await session.attachGoalThread()
+  await session.setGoal(allowed, 'active', 'Finish the smoke test', 'automatic')
+  expect(await result).toBe('Goal achieved')
+  expect(await session.goal()).toMatchObject({ status: 'complete', origin: 'automatic' })
+})
+
+test('refuses to start without managed ChatGPT authentication', async () => {
+  const session = fixture('apiKey').create()
+  await expect(session.initialize()).rejects.toThrow('managed ChatGPT login')
+})
+
+test('delivers the photo as a native localImage input', async () => {
+  const session = fixture().create()
+  await session.initialize()
+  expect(await session.run('Describe this', ['/tmp/picture.jpg'])).toEqual({
+    status: 'completed', text: 'Describe this|localImage:/tmp/picture.jpg',
+  })
+})
+
+test('relays one active command approval and rejects mismatched or incomplete requests', async () => {
+  const seen: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async approval => {
+    seen.push(approval)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:valid')).text).toBe('accept')
+  expect((await session.run('approval:foreign')).text).toBe('decline')
+  expect((await session.run('approval:incomplete')).text).toBe('decline')
+  expect(seen).toHaveLength(1)
+  expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test', cwd: '/workspace' })
+})
+
+test('suppresses pending and denied duplicates within a turn and asks again in the next turn', async () => {
+  let shown = 0
+  const session = fixture('chatgpt', async () => {
+    const decision = shown++ === 0 ? 'decline' : 'accept'
+    await Bun.sleep(30)
+    return decision
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:repeated')).text).toBe('decline,decline,decline')
+  expect(shown).toBe(1)
+  expect((await session.run('approval:repeated')).text).toBe('accept,decline,accept')
+  expect(shown).toBe(3)
+})
+
+test('relays a verified subagent approval and rejects a different child turn', async () => {
+  const seen: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async approval => {
+    seen.push(approval)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:child')).text).toBe('accept')
+  expect((await session.run('approval:child-wrong-turn')).text).toBe('decline')
+  expect(seen).toHaveLength(1)
+  expect(seen[0]).toMatchObject({ kind: 'command', target: 'printf test' })
+})
+
+test('asks once for the exact local network destination without allowing persistent, remote or unseen actions', async () => {
+  const seen: ApprovalRequest[] = []
+  const session = fixture('chatgpt', async approval => {
+    seen.push(approval)
+    return 'accept'
+  }).create()
+  await session.initialize()
+  expect((await session.run('approval:network')).text).toBe('accept')
+  expect((await session.run('approval:network-persistent-only')).text).toBe('decline')
+  expect((await session.run('approval:network-remote')).text).toBe('decline')
+  expect((await session.run('approval:network-invalid')).text).toBe('decline')
+  expect((await session.run('approval:stdin')).text).toBe('decline')
+  expect((await session.run('approval:stdin-visible')).text).toBe('accept')
+  expect(seen).toHaveLength(2)
+  expect(seen[0]).toMatchObject({ kind: 'network', target: 'https://example.test:443\n\nprintf test' })
+  expect(seen[1]).toMatchObject({ kind: 'stdin', target: "write_stdin --session-id 123 'test input'" })
+})
+
+test('reuses one YAML decision for the same Codex command and asks again for a different command', async () => {
+  const seen: ApprovalRequest[] = []
+  let session: CodexSession
+  const server = await startExternalTasks(0, 'test-agent', '123', () => 'accepted', {
+    token: 'test-policy', request: request => session.requestPolicyApproval(request),
+  })
+  try {
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('No fixture port')
+    session = fixture('chatgpt', async approval => {
+      seen.push(approval)
+      return 'accept'
+    }, undefined, { ...process.env, KROT_TEST_POLICY_URL: `http://127.0.0.1:${address.port}/hooks/permission/request` }).create()
+    await session.initialize()
+    expect((await session.run('approval:policy')).text).toBe('accept')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.reason).toBeUndefined()
+    expect(seen[0]?.notice).toContain('вне песочницы')
+    expect((await session.run('approval:policy-production-shell')).text).toBe('accept')
+    expect(seen).toHaveLength(2)
+    expect((await session.run('approval:policy-mismatch')).text).toBe('accept')
+    expect(seen.map(request => request.target)).toEqual([
+      'printf test', 'printf test', 'printf test', "/usr/bin/bash -lc 'printf other'",
+    ])
+    seen.length = 0
+    expect((await session.run('approval:policy-file')).text).toBe('accept')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.target).toContain('*** Delete File: nested/remove.txt')
+    expect((await session.run('approval:policy-file-mismatch')).text).toBe('accept')
+    expect(seen).toHaveLength(3)
+    expect(seen.at(-1)?.target).toContain('+different')
+  } finally { server.close() }
+})
+
+test('risky mode silently accepts only a routine local command and keeps the original approval path', async () => {
+  const seen: ApprovalRequest[] = []
+  const approve = async (request: ApprovalRequest) => {
+    seen.push(request)
+    return 'decline' as const
+  }
+  const ordinary = fixture('chatgpt', approve).create()
+  await ordinary.initialize()
+  expect((await ordinary.run('approval:routine')).text).toBe('decline')
+  expect(seen).toHaveLength(1)
+  seen.length = 0
+
+  const session = fixture('chatgpt', approve, undefined, process.env, true).create()
+  await session.initialize()
+  expect((await session.run('approval:routine')).text).toBe('accept')
+  expect(seen).toHaveLength(0)
+  expect((await session.run('approval:risky')).text).toBe('decline')
+  expect((await session.run('approval:routine-remote')).text).toBe('decline')
+  expect((await session.run('approval:network')).text).toBe('decline')
+  expect(seen.map(request => request.kind)).toEqual(['command', 'command', 'network'])
+  expect(seen[0]?.target).toContain('rm -r')
+})
