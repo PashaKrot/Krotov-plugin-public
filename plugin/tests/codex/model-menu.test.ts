@@ -8,7 +8,7 @@ import { ControlState } from '../../src/codex/control-state.js'
 import { ModelMenu, STALE_MODEL_MENU } from '../../src/codex/model-menu.js'
 import type { CodexModel } from '../../src/codex/reasoning.js'
 
-function fixture(root: string) {
+function fixture(root: string, defaultModel: string | null = 'gpt-configured') {
   const controls = new ControlState(root, false)
   const sent: SendMessageOpts[] = []
   const confirmations: Array<{ id: number; text: string }> = []
@@ -16,8 +16,10 @@ function fixture(root: string) {
     { name: 'gpt-other', default: false }, { name: 'gpt-default', default: true },
   ]
   let edited: SendMessageOpts | undefined
+  let currentModel: string | undefined
   const menu = new ModelMenu({
-    ownerId: 42, chat: '42', controls, defaultModel: 'gpt-configured',
+    ownerId: 42, chat: '42', controls, defaultModel: defaultModel ?? undefined,
+    currentModel: () => currentModel,
     models: async () => catalog,
     telegram: {
       async sendMessage(_chat, _text, options) {
@@ -34,8 +36,38 @@ function fixture(root: string) {
   const query = () => ({ fromId: 42, chatId: 42, chatType: 'private', messageId: sent.length + 100,
     data: rendered().find(button => button.text === 'gpt-other')!.callback_data! })
   const effortButtons = () => edited?.reply_markup?.inline_keyboard.flat() ?? []
-  return { controls, menu, rendered, query, confirmations, effortButtons, setCatalog: (next: typeof catalog) => { catalog = next } }
+  return { controls, menu, rendered, query, confirmations, effortButtons,
+    setCatalog: (next: typeof catalog) => { catalog = next },
+    setCurrentModel: (name: string) => { currentModel = name },
+  }
 }
+
+test('effort opens levels for the current model and saves only the level', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'krotov-model-menu-'))
+  try {
+    const { controls, menu, rendered, setCatalog, setCurrentModel } = fixture(root, null)
+    setCatalog([
+      { name: 'gpt-default', default: true, reasoningEfforts: ['medium'] },
+      { name: 'gpt-other', default: false, reasoningEfforts: ['low', 'high'] },
+    ])
+    setCurrentModel('gpt-other')
+    await menu.openEffort()
+    expect(rendered().map(button => button.text)).toEqual(['low', '✓ high'])
+    const choice = { fromId: 42, chatId: 42, chatType: 'private', messageId: 101,
+      data: rendered()[0]!.callback_data! }
+    expect(await menu.answer({ ...choice, fromId: 15 })).toBeUndefined()
+    setCurrentModel('gpt-default')
+    expect(await menu.answer(choice)).toBe(STALE_MODEL_MENU)
+    expect(controls.reasoningEffort).toBeUndefined()
+    setCurrentModel('gpt-other')
+    expect(await menu.answer(choice)).toBe('Уровень рассуждений: low')
+    expect(new ControlState(root, false)).toMatchObject({ model: undefined, reasoningEffort: 'low' })
+    expect(await menu.answer(choice)).toBe(STALE_MODEL_MENU)
+    controls.selectModel('gpt-default', 'medium')
+    await menu.openEffort()
+    expect(rendered().map(button => button.text)).toEqual(['✓ medium'])
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
 
 test('model buttons open supported reasoning levels and persist the pair for the next turn', async () => {
   const root = mkdtempSync(join(tmpdir(), 'krotov-model-menu-'))

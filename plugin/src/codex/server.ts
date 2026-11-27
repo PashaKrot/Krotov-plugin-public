@@ -521,6 +521,7 @@ async function main(): Promise<void> {
     const modelMenu = new ModelMenu({
       ownerId, chat: ownerChat, telegram, controls,
       models: () => codex.models(), defaultModel: process.env.KROT_CODEX_MODEL,
+      currentModel: () => codex.status.model,
     })
     const sourceRepo = [join(import.meta.dir, '../../..'), dirname(process.cwd()), process.cwd()].find(path =>
       existsSync(join(path, '.git')) && existsSync(join(path, 'plugin/package.json')))
@@ -1170,6 +1171,10 @@ async function main(): Promise<void> {
       if (name === 'stop') return stop()
       if (name === 'compact') return compact()
       if (name === 'cc') return handleCc(args, messageId)
+      if (name === 'effort') {
+        await modelMenu.openEffort().catch(() => send('Не удалось получить уровни рассуждений. Попробуй /effort ещё раз.'))
+        return
+      }
       if (name === 'goal') return handleGoal(args)
       if (name === 'doctor') {
         void doctor.handle(args).catch(() => log.warn('Could not send the doctor report'))
@@ -1302,7 +1307,7 @@ async function main(): Promise<void> {
         chatType: ctx.chat.type, messageId: ctx.callbackQuery.message?.message_id,
       }).catch(() => {
         log.warn('Could not select the Codex model or reasoning effort')
-        return 'Не удалось изменить настройку. Открой /cc model заново.'
+        return 'Не удалось изменить настройку. Открой /effort или /cc model заново.'
       })
       if (response) await ctx.answerCallbackQuery({ text: response.slice(0, 200) }).catch(() => undefined)
     })
@@ -1483,7 +1488,7 @@ async function main(): Promise<void> {
 
       const text = ctx.message.text?.trim()
       const command = ctx.message.forward_origin ? undefined : parseCodexCommand(text, bot.botInfo.username ?? '')
-      if (command?.name === 'doctor') return handleCommand(command.name, command.args)
+      if (command?.name === 'doctor' || command?.name === 'effort') return handleCommand(command.name, command.args)
       if (text && !ctx.message.forward_origin) questionStore.clear(ownerChat)
       if (!ctx.message.forward_origin && ownerTaskWithdrawn(text)) {
         await stop()

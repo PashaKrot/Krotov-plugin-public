@@ -12,6 +12,7 @@ const specs = [
   { command: 'mirror', description: 'ход работы: on | off | status' },
   { command: 'lease', description: 'выдать, посмотреть или отозвать мандат' },
   { command: 'cc', description: 'модель, сессии, экспорт и лимиты Codex' },
+  { command: 'effort', description: 'выбрать уровень рассуждений текущей модели' },
   { command: 'goal', description: 'поставить, посмотреть или приостановить длинную цель' },
   { command: 'memory', description: 'управлять предложениями памяти и навыками' },
   { command: 'pin', description: 'закрепить сообщение, на которое ответил' },

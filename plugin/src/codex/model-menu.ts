@@ -4,11 +4,11 @@ import type { ControlState } from './control-state.js'
 import { effectiveEffort, type CodexModel, type ReasoningEffort } from './reasoning.js'
 
 export const MODEL_MENU_CALLBACK = /^krot:cm:([a-f0-9]{16}):(\d{1,2})$/u
-export const STALE_MODEL_MENU = 'Меню устарело. Открой /cc model заново.'
+export const STALE_MODEL_MENU = 'Меню устарело. Открой /effort или /cc model заново.'
 const unknownModel = 'Такой модели нет в списке /cc model.'
 
 type Menu = { key: string; messageId: number } & (
-  { names: string[] } | { model: string; efforts: readonly ReasoningEffort[] }
+  { names: string[] } | { model: string; efforts: readonly ReasoningEffort[]; effortOnly?: boolean }
 )
 
 interface ModelMenuOptions {
@@ -18,6 +18,7 @@ interface ModelMenuOptions {
   controls: Pick<ControlState, 'model' | 'reasoningEffort' | 'selectModel'>
   models: () => Promise<CodexModel[]>
   defaultModel: string | undefined
+  currentModel?: () => string | undefined
 }
 
 interface ModelQuery {
@@ -63,6 +64,29 @@ export class ModelMenu {
     if (this.opening === key) this.menu = { key, names, messageId: sent.message_id }
   }
 
+  async openEffort(): Promise<void> {
+    const { chat, controls, telegram } = this.options
+    const key = this.opening = randomBytes(8).toString('hex')
+    this.menu = undefined
+    const catalog = await this.options.models()
+    if (this.opening !== key) return
+    const name = this.currentModel(catalog)
+    const model = catalog.find(entry => entry.name === name)
+    if (!model) {
+      await telegram.sendMessage(chat, 'Не удалось определить текущую модель Codex.', {})
+      return
+    }
+    const efforts = model.reasoningEfforts
+    if (!efforts?.length) {
+      await telegram.sendMessage(chat, 'Для ' + model.name + ' Codex не сообщил доступные уровни рассуждений.', {})
+      return
+    }
+    const sent = await telegram.sendMessage(chat, 'Уровень рассуждений для ' + model.name, {
+      reply_markup: keyboard(key, efforts, effectiveEffort(model, controls.reasoningEffort)),
+    })
+    if (this.opening === key) this.menu = { key, model: model.name, efforts, messageId: sent.message_id, effortOnly: true }
+  }
+
   async choose(value: string): Promise<string> {
     const models = await this.options.models()
     const name = value === 'default'
@@ -85,6 +109,8 @@ export class ModelMenu {
     if (!choice) return STALE_MODEL_MENU
     const catalog = await this.options.models()
     if (this.menu !== menu) return STALE_MODEL_MENU
+    const effortOnly = 'efforts' in menu && menu.effortOnly === true
+    if (effortOnly && this.currentModel(catalog) !== menu.model) return STALE_MODEL_MENU
     const model = catalog.find(entry => entry.name === ('names' in menu ? choice : menu.model))
     if (!model) return unknownModel
     const efforts = model.reasoningEfforts
@@ -103,17 +129,24 @@ export class ModelMenu {
       return 'Выбери уровень рассуждений'
     }
     const effort = 'efforts' in menu ? menu.efforts[Number(match[2])] : undefined
-    if (effort && !efforts?.includes(effort)) return 'Этот уровень сейчас недоступен. Открой /cc model заново.'
-    const confirmation = this.select(model.name, effort, effort)
+    if (effort && !efforts?.includes(effort)) return 'Этот уровень сейчас недоступен. Открой меню заново.'
+    const confirmation = this.select(model.name, effort, effort, effortOnly)
     await telegram.editMessageText(chat, menu.messageId, confirmation, { reply_markup: { inline_keyboard: [] } })
       .catch(() => undefined)
     return effort ? 'Уровень рассуждений: ' + effort : 'Модель: ' + model.name
   }
 
-  private select(name: string, effort?: ReasoningEffort, effective?: ReasoningEffort): string {
-    this.options.controls.selectModel(name, effort)
+  private currentModel(models: CodexModel[]): string | undefined {
+    const { controls, defaultModel, currentModel } = this.options
+    return controls.model ?? defaultModel ?? currentModel?.() ?? models.find(model => model.default)?.name
+  }
+
+  private select(name: string, effort?: ReasoningEffort, effective?: ReasoningEffort, effortOnly = false): string {
+    const { controls } = this.options
+    controls.selectModel(effortOnly ? controls.model : name, effort)
     this.menu = undefined
     this.opening = undefined
+    if (effortOnly) return 'Уровень рассуждений для следующих запросов: ' + effort
     return 'Модель для следующих запросов: ' + name + (effective ? '\nУровень рассуждений: ' + effective : '')
   }
 }
